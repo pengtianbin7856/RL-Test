@@ -1,0 +1,290 @@
+import traci
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+from collections import deque
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# ====================== 路网配置 ======================
+SUMO_CONFIG = r"D:\SUMO\doc\examples\sumo\simple_nets\cross\cross1ltl\test.sumocfg"
+
+# ====================== 全局变量：严格控制红绿灯 ======================
+LAST_SWITCH_TIME = 0
+MIN_GREEN_INTERVAL = 15  # 绿灯最少15秒，绝不乱切
+
+# ====================== 超参数 ======================
+ALPHA = 0.1
+GAMMA = 0.99
+EPSILON = 0.1
+EPS_DECAY = 0.97
+MIN_EPS = 0.01
+ACTIONS = [0, 1]
+EPISODES = 80          # 固定80轮
+STEP_LIMIT = 700
+
+# DQN 参数
+BATCH_SIZE = 32
+MEMORY_SIZE = 15000
+LEARNING_RATE_DQN = 0.0008
+
+# ====================== 状态获取 ======================
+def get_state(tl):
+    n = min(traci.lane.getLastStepHaltingNumber("1i_0"), 10)
+    s = min(traci.lane.getLastStepHaltingNumber("3i_0"), 10)
+    p = traci.trafficlight.getPhase(tl)
+    return np.array([n, s, p], dtype=np.float32)
+
+def get_total_queue():
+    q1 = traci.lane.getLastStepHaltingNumber("1i_0")
+    q2 = traci.lane.getLastStepHaltingNumber("2i_0")
+    q3 = traci.lane.getLastStepHaltingNumber("3i_0")
+    q4 = traci.lane.getLastStepHaltingNumber("4i_0")
+    return q1 + q2 + q3 + q4
+
+# ====================== 奖励函数：前负后正 ======================
+def get_reward():
+    total_queue = get_total_queue()
+    reward = 60 - total_queue  # 排队<60 → 正，排队>60 → 负
+
+    q_ew = traci.lane.getLastStepHaltingNumber("2i_0") + traci.lane.getLastStepHaltingNumber("4i_0")
+    if q_ew > 4:
+        reward -= 25
+    return reward
+
+# ====================== 核心修复：红绿灯不会乱切 ======================
+def act(tl, action):
+    global LAST_SWITCH_TIME
+    now = traci.simulation.getTime()
+
+    # 强制15秒内不能切换相位！
+    if now - LAST_SWITCH_TIME < MIN_GREEN_INTERVAL:
+        return
+
+    if action == 1:
+        cp = traci.trafficlight.getPhase(tl)
+        new_phase = 1 if cp == 0 else 0
+        traci.trafficlight.setPhase(tl, new_phase)
+        traci.trafficlight.setPhaseDuration(tl, 0)
+        LAST_SWITCH_TIME = now
+
+# ====================== DQN 网络 ======================
+class DQNNet(nn.Module):
+    def __init__(self, state_size=3, action_size=2):
+        super(DQNNet, self).__init__()
+        self.fc1 = nn.Linear(state_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, action_size)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+class DQN:
+    def __init__(self):
+        self.model = DQNNet()
+        self.target_model = DQNNet()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=LEARNING_RATE_DQN)
+        self.memory = deque(maxlen=MEMORY_SIZE)
+        self.target_model.load_state_dict(self.model.state_dict())
+        self.losses = []
+
+    def remember(self, s, a, r, s2, done):
+        self.memory.append((s, a, r, s2, done))
+
+    def act(self, s, eps):
+        if np.random.rand() <= eps:
+            return random.choice(ACTIONS)
+        s = torch.FloatTensor(s)
+        q_values = self.model(s)
+        return torch.argmax(q_values).item()
+
+    def replay(self):
+        if len(self.memory) < BATCH_SIZE:
+            return
+        batch = random.sample(self.memory, BATCH_SIZE)
+        losses = []
+        for s, a, r, s2, done in batch:
+            s = torch.FloatTensor(s)
+            s2 = torch.FloatTensor(s2)
+            q = self.model(s)[a]
+            with torch.no_grad():
+                max_q = self.target_model(s2).max().item()
+                target = r + GAMMA * max_q
+            loss = nn.MSELoss()(q, torch.tensor(target, dtype=torch.float32))
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            losses.append(loss.item())
+        if losses:
+            self.losses.append(np.mean(losses))
+
+    def update_target(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+
+# ====================== Q-Learning ======================
+def run_q_learning():
+    global LAST_SWITCH_TIME
+    print("\n▶ Training Q-Learning...")
+    Q = {}
+    eps = EPSILON
+    rewards = []
+    queues = []
+    switches = []
+
+    def q(s, a): return Q.get((tuple(s), a), 0.0)
+
+    for ep in range(EPISODES):
+        LAST_SWITCH_TIME = 0
+        traci.start(["sumo", "-c", SUMO_CONFIG, "--quit-on-end"])
+        tl = traci.trafficlight.getIDList()[0]
+        total_r = 0
+        total_q = 0
+        switch_cnt = 0
+        last_phase = traci.trafficlight.getPhase(tl)
+        step = 0
+
+        while step < STEP_LIMIT:
+            traci.simulationStep()
+            s = get_state(tl)
+            a = random.choice(ACTIONS) if random.random() < eps else np.argmax([q(s, 0), q(s, 1)])
+            act(tl, a)
+            r = get_reward()
+            s2 = get_state(tl)
+            best = max(q(s2, 0), q(s2, 1))
+            Q[(tuple(s), a)] = (1 - ALPHA) * q(s, a) + ALPHA * (r + GAMMA * best)
+            total_r += r
+            total_q += get_total_queue()
+            curr_phase = traci.trafficlight.getPhase(tl)
+            if curr_phase != last_phase:
+                switch_cnt += 1
+                last_phase = curr_phase
+            step += 1
+
+        traci.close()
+        rewards.append(total_r)
+        queues.append(total_q)
+        switches.append(switch_cnt)
+        if eps > MIN_EPS: eps *= EPS_DECAY
+        print(f"Q  Episode {ep+1:2d} | Reward: {total_r:7.0f} | Queue: {total_q:6.0f}")
+    return rewards, queues, switches
+
+# ====================== DQN ======================
+def run_dqn():
+    global LAST_SWITCH_TIME
+    print("\n▶ Training DQN...")
+    dqn = DQN()
+    eps = EPSILON
+    rewards = []
+    queues = []
+    switches = []
+
+    for ep in range(EPISODES):
+        LAST_SWITCH_TIME = 0
+        traci.start(["sumo", "-c", SUMO_CONFIG, "--quit-on-end"])
+        tl = traci.trafficlight.getIDList()[0]
+        total_r = 0
+        total_q = 0
+        switch_cnt = 0
+        last_phase = traci.trafficlight.getPhase(tl)
+        step = 0
+
+        while step < STEP_LIMIT:
+            traci.simulationStep()
+            s = get_state(tl)
+            a = dqn.act(s, eps)
+            act(tl, a)
+            r = get_reward()
+            s2 = get_state(tl)
+            done = (step == STEP_LIMIT - 1)
+            dqn.remember(s, a, r, s2, done)
+            dqn.replay()
+            total_r += r
+            total_q += get_total_queue()
+            curr_phase = traci.trafficlight.getPhase(tl)
+            if curr_phase != last_phase:
+                switch_cnt += 1
+                last_phase = curr_phase
+            step += 1
+
+        if ep % 5 == 0:
+            dqn.update_target()
+        traci.close()
+        rewards.append(total_r)
+        queues.append(total_q)
+        switches.append(switch_cnt)
+        if eps > MIN_EPS: eps *= EPS_DECAY
+        print(f"DQN Episode {ep+1:2d} | Reward: {total_r:7.0f} | Queue: {total_q:6.0f}")
+    return rewards, queues, switches, dqn.losses
+
+# ====================== 绘图工具 ======================
+def moving_average(data, window=5):
+    return np.convolve(data, np.ones(window)/window, mode='valid')
+
+# ====================== 绘图 ======================
+def plot_all(q_r, q_q, q_s, dqn_r, dqn_q, dqn_s, dqn_loss):
+    plt.rcParams['figure.figsize'] = (16, 12)
+    x = np.arange(1, EPISODES+1)
+    x_smooth = np.arange(1, len(moving_average(q_r))+1)
+
+    plt.subplot(3,2,1)
+    plt.plot(x, q_r, label='Q-Learning')
+    plt.plot(x, dqn_r, label='DQN')
+    plt.title("Total Reward per Episode")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(3,2,2)
+    plt.plot(x_smooth, moving_average(q_r), label='Q-Learning')
+    plt.plot(x_smooth, moving_average(dqn_r), label='DQN')
+    plt.title("Smoothed Reward (Moving Average)")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(3,2,3)
+    plt.plot(x, q_q, label='Q-Learning')
+    plt.plot(x, dqn_q, label='DQN')
+    plt.title("Total Vehicle Queue")
+    plt.xlabel("Episode")
+    plt.ylabel("Queue Count")
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(3,2,4)
+    plt.plot(x, q_s, label='Q-Learning')
+    plt.plot(x, dqn_s, label='DQN')
+    plt.title("Traffic Light Switch Count")
+    plt.xlabel("Episode")
+    plt.ylabel("Switches")
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(3,2,5)
+    plt.plot(moving_average(dqn_loss))
+    plt.title("DQN Training Loss (Smoothed)")
+    plt.xlabel("Update Step")
+    plt.ylabel("Loss")
+    plt.grid(True)
+
+    plt.subplot(3,2,6)
+    plt.boxplot([q_r, dqn_r], labels=["Q-Learning", "DQN"])
+    plt.title("Reward Distribution Comparison")
+    plt.ylabel("Reward")
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig("Result_80ep.png", dpi=300)
+    plt.show()
+
+# ====================== 主程序 ======================
+if __name__ == "__main__":
+    q_r, q_q, q_s = run_q_learning()
+    dqn_r, dqn_q, dqn_s, dqn_loss = run_dqn()
+    plot_all(q_r, q_q, q_s, dqn_r, dqn_q, dqn_s, dqn_loss)
+    print("\n✅ 训练完成！80轮结果已保存")
